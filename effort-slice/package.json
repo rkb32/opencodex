@@ -1,0 +1,6 @@
+{
+  "name": "effort-slice",
+  "private": true,
+  "type": "module",
+  "scripts": { "test": "node --test" }
+}
