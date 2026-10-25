@@ -9,13 +9,14 @@ const scope = {
   cohort: "cohort-1", provider: "anthropic", destination: "api.anthropic.com",
   adapter: "anthropic", model: "opus-5-5", credential: "acct-1",
 };
-const base = { chatLineage: "chat-1", scope, frame: "frame-A", generation: "g1", cacheControl: true, stripped: false, thinking: "enabled", limit: 8192, transport: "http" };
+const NEW_META = JSON.stringify({ history_initialization: "New" });
+const base = { chatLineage: "chat-1", scope, frame: "frame-A", generation: "g1", cacheControl: true, stripped: false, thinking: "enabled", explicitCap: 8192, turnMetadata: NEW_META, transport: "http" };
 const user = (text) => ({ kind: "user", text });
 const asst = (text) => ({ kind: "assistant", text });
 const tool = (text) => ({ kind: "tool_result", text });
 const developer = (text) => ({ kind: "developer", text });
 const cfg = { kind: "configuration_update", effort: "high" };
-const ON = { enabled: true, activated: true, lineageSignal: true };
+const ON = { enabled: true, activated: true, compactionMarkerIdentified: true };
 
 // Turn 1 of a chat: new history, committed. Returns the transcript as the client now holds it.
 function startChat(store, { effort = "low", P = 100, opts = ON, text = "fix the bug" } = {}) {
@@ -60,7 +61,7 @@ test("scope missing cohort: off", () => {
 });
 
 test("no lineage signal: a new chat never starts a history", () => {
-  const d = decide(createStore(), { ...base, parent: [], suffix: [user("hi")] }, { ...ON, lineageSignal: false });
+  const d = decide(createStore(), { ...base, turnMetadata: undefined, parent: [], suffix: [user("hi")] }, ON);
   assert.equal(d.reason, "no-history");
 });
 
@@ -92,8 +93,7 @@ test("metadata: only an explicit history_initialization New is a new-chat signal
 });
 
 test("resume (ColdResume signal) with a non-empty parent and empty store: off, never new", () => {
-  const lineage = lineageFromMetadata(JSON.stringify({ history_initialization: "ColdResume" }));
-  const d = decide(createStore(), { ...base, parent: [user("old"), asst("x")], suffix: [user("next")] }, { ...ON, lineageSignal: lineage });
+  const d = decide(createStore(), { ...base, turnMetadata: JSON.stringify({ history_initialization: "ColdResume" }), parent: [user("old"), asst("x")], suffix: [user("next")] }, ON);
   assert.equal(d.reason, "no-history");
 });
 
@@ -252,15 +252,20 @@ test("thinking change on a retry: off and parent deleted (rule 3b before rule 4)
   assert.equal(store.entries.size, 0);
 });
 
-test("output limit different from the anchor (lower or higher): off and entry deleted", () => {
+
+test("output limit derived from effort: a higher effort's larger limit makes the decrease off", () => {
   const store = createStore();
-  const t = startChat(store, { effort: "high" });
-  const lower = decide(store, { ...base, limit: 4096, effort: "low", parent: t, suffix: [user("next")] }, ON);
-  assert.equal(lower.reason, "limit-differs");
+  const noCap = { ...base, explicitCap: undefined };
+  const d0 = decide(store, { ...noCap, effort: "high", parent: [], suffix: [user("fix")] }, ON);
+  const out = [asst("done")];
+  commit(store, d0.pendingToken, { messageStop: true, cacheRead: 0, P: 100, outputItems: out, generation: "g1" });
+  const d = decide(store, { ...noCap, effort: "low", parent: [user("fix"), ...out], suffix: [user("next")] }, ON);
+  assert.equal(d.reason, "limit-differs");
   assert.equal(store.entries.size, 0);
 });
 
-test("same output limit on a later effort decrease: matched", () => {
+
+test("explicit client cap: the same limit on a later effort decrease is matched", () => {
   const store = createStore();
   const t = startChat(store, { effort: "high" });
   const d = decide(store, { ...base, effort: "low", parent: t, suffix: [user("next")] }, ON);
@@ -293,13 +298,19 @@ test("P = 0 is never committed", () => {
   assert.equal(store.entries.size, 0);
 });
 
-test("failure before sending restores the matched parent", () => {
+
+test("failure before sending: default is delete (section 9); restore only with the owner-enabled flag", () => {
   const store = createStore();
   const t = startChat(store, { effort: "low" });
   const d = decide(store, { ...base, effort: "low", parent: t, suffix: [user("next")] }, ON);
   const res = commit(store, d.pendingToken, { failedBeforeSend: true, messageStop: false });
-  assert.equal(res.action, "restored");
-  assert.equal(store.entries.size, 1);
+  assert.equal(res.reason, "failed-before-send");
+  assert.equal(store.entries.size, 0);
+  const store2 = createStore();
+  const t2 = startChat(store2, { effort: "low" });
+  const d2 = decide(store2, { ...base, effort: "low", parent: t2, suffix: [user("next")] }, ON);
+  assert.equal(commit(store2, d2.pendingToken, { failedBeforeSend: true, restoreOnFailure: true }).action, "restored");
+  assert.equal(store2.entries.size, 1);
 });
 
 test("failure before sending deletes a new-history placeholder (no restore)", () => {
@@ -403,7 +414,7 @@ test("400 that names the beta or effort message: capability unsupported, no rese
   const store = createStore();
   const t = startChat(store, { effort: "low" });
   const d = decide(store, { ...base, effort: "low", parent: t, suffix: [user("next")] }, ON);
-  const res = rejectUpstream(store, d.pendingToken, { status: 400, namesBetaOrEffort: true });
+  const res = rejectUpstream(store, d.pendingToken, { status: 400, errorText: "mid-conversation-output-config-2026-07-01 unsupported" });
   assert.equal(res.reason, "capability-unsupported");
   assert.equal(store.entries.size, 0);
   const next = decide(store, { ...base, effort: "low", parent: t, suffix: [user("again")] }, ON);
@@ -414,7 +425,7 @@ test("other 400: error to caller, no resend, entry deleted, no capability record
   const store = createStore();
   const t = startChat(store, { effort: "low" });
   const d = decide(store, { ...base, effort: "low", parent: t, suffix: [user("next")] }, ON);
-  const res = rejectUpstream(store, d.pendingToken, { status: 400, namesBetaOrEffort: false });
+  const res = rejectUpstream(store, d.pendingToken, { status: 400, errorText: "max_tokens too large" });
   assert.equal(res.action, "error");
   assert.equal(res.reason, "other-400");
   assert.equal(store.entries.size, 0);
@@ -479,7 +490,7 @@ test("failed matched send restores when the store has room", () => {
     const n = decide(store, { ...base, effort: "low", parent: [], suffix: [user(`chat ${i}`)] }, ON);
     commit(store, n.pendingToken, { messageStop: true, cacheRead: 0, P: 100, outputItems: [asst("x".repeat(100 * 1024))], generation: "g1" });
   }
-  const res = commit(store, d.pendingToken, { failedBeforeSend: true });
+  const res = commit(store, d.pendingToken, { failedBeforeSend: true, restoreOnFailure: true });
   let total = 0;
   for (const e of store.entries.values()) total += e.bytes;
   assert.equal(res.action, "restored");
@@ -515,12 +526,15 @@ test("change point position: with leading tool results, the change point is befo
   assert.equal(d.changePoint, true);
 });
 
-test("output limit higher than the anchor's: off and entry deleted", () => {
+
+test("output limit derived from effort: a lower anchor with a higher request is off", () => {
   const store = createStore();
-  const t = startChat(store, { effort: "high" });
-  const higher = decide(store, { ...base, limit: 16384, effort: "low", parent: t, suffix: [user("next")] }, ON);
-  assert.equal(higher.reason, "limit-differs");
-  assert.equal(store.entries.size, 0);
+  const noCap = { ...base, explicitCap: undefined };
+  const d0 = decide(store, { ...noCap, effort: "low", parent: [], suffix: [user("fix")] }, ON);
+  const out = [asst("done")];
+  commit(store, d0.pendingToken, { messageStop: true, cacheRead: 0, P: 100, outputItems: out, generation: "g1" });
+  const d = decide(store, { ...noCap, effort: "high", parent: [user("fix"), ...out], suffix: [user("next")] }, ON);
+  assert.equal(d.reason, "limit-differs");
 });
 
 test("three turns with an effort change: turn 3 gets every change point, not only its own", () => {
@@ -560,7 +574,7 @@ test("abandon before any byte was sent restores the matched parent; after a send
   const store = createStore();
   const t = startChat(store, { effort: "low" });
   const d = decide(store, { ...base, effort: "low", parent: t, suffix: [user("next")] }, ON);
-  assert.equal(abandon(store, d.pendingToken, { sent: false }).action, "restored");
+  assert.equal(abandon(store, d.pendingToken, { sent: false, restoreOnFailure: true }).action, "restored");
   assert.equal(store.entries.size, 1);
   const d2 = decide(store, { ...base, effort: "low", parent: t, suffix: [user("next")] }, ON);
   assert.equal(abandon(store, d2.pendingToken, { sent: true }).reason, "abandoned");
@@ -765,4 +779,72 @@ test("generation: a change between admission and commit is refused even when the
   const d = decide(store, { ...base, effort: "low", parent: t, suffix: [user("next")] }, ON);
   const res = commit(store, d.pendingToken, { messageStop: true, cacheRead: 100, P: 100, outputItems: [asst("r")], generation: "g2" });
   assert.equal(res.reason, "generation-changed");
+});
+
+// --- Review round 5 (2026-10-25) ---
+import { effectiveLimit } from "./effort-history.js";
+
+test("effective limit follows the section 6 derivation at each effort level (no explicit cap)", () => {
+  const cases = { minimal: 12288, low: 12288, medium: 16384, high: 24576, xhigh: 32768, max: 40192 };
+  for (const [effort, want] of Object.entries(cases)) {
+    assert.equal(effectiveLimit({ effort, omittedMaxTokens: 8192 }), want, effort);
+  }
+  assert.equal(effectiveLimit({ effort: "high", explicitCap: 4000 }), 4000);
+});
+
+test("P = 0 new history: the turn-1 retry is a replay (off), not a second history", () => {
+  const store = createStore();
+  const d = decide(store, { ...base, effort: "low", parent: [], suffix: [user("hi")] }, ON);
+  const res = commit(store, d.pendingToken, { messageStop: true, cacheRead: 0, P: 0, outputItems: [asst("r")], generation: "g1" });
+  assert.equal(res.reason, "P-zero");
+  const retry = decide(store, { ...base, effort: "low", parent: [], suffix: [user("hi")] }, ON);
+  assert.equal(retry.reason, "replay");
+});
+
+test("Fable is off until its wire ID is checked", () => {
+  const store = createStore();
+  const d = decide(store, { ...base, scope: { ...scope, model: "claude-fable-5-1" }, effort: "low", parent: [], suffix: [user("hi")] }, ON);
+  assert.equal(d.reason, "fable-wire-id-unchecked");
+});
+
+test("compaction marker not identified: new history is off even with the NEW header", () => {
+  const store = createStore();
+  const d = decide(store, { ...base, effort: "low", parent: [], suffix: [user("hi")] }, { enabled: true, activated: true });
+  assert.equal(d.reason, "compaction-marker-unidentified");
+});
+
+test("400 that only mentions effort in another context: no capability record", () => {
+  const store = createStore();
+  const t = startChat(store, { effort: "low" });
+  const d = decide(store, { ...base, effort: "low", parent: t, suffix: [user("next")] }, ON);
+  rejectUpstream(store, d.pendingToken, { status: 400, errorText: "max_tokens with effort high is too large" });
+  assert.equal(store.capability.size, 0);
+});
+
+test("capability is per model and destination: a beta 400 in one chat marks the next chat too", () => {
+  const store = createStore();
+  const t = startChat(store, { effort: "low", text: "chat one" });
+  const d = decide(store, { ...base, chatLineage: "chat-1", effort: "low", parent: t, suffix: [user("next")] }, ON);
+  rejectUpstream(store, d.pendingToken, { status: 400, errorText: "mid-conversation-output-config-2026-07-01 unsupported" });
+  const other = decide(store, { ...base, chatLineage: "chat-2", effort: "low", parent: [], suffix: [user("another")] }, ON);
+  assert.equal(other.reason, "capability-unsupported");
+});
+
+test("projection positive control over a wire round trip: the echoed answer matches", () => {
+  const store = createStore();
+  const d0 = decide(store, { ...base, effort: "low", parent: [], suffix: [user("fix")] }, ON);
+  const out = [asst("done")];
+  commit(store, d0.pendingToken, { messageStop: true, cacheRead: 0, P: 100, outputItems: out, generation: "g1" });
+  const echoed = JSON.parse(JSON.stringify([user("fix"), ...out]));
+  const d = decide(store, { ...base, effort: "low", parent: echoed, suffix: [user("second")] }, ON);
+  assert.equal(d.kind, "matched");
+});
+
+test("projection shape drift: an echo that adds a field misses, so the next turn is off", () => {
+  const store = createStore();
+  const d0 = decide(store, { ...base, effort: "low", parent: [], suffix: [user("fix")] }, ON);
+  commit(store, d0.pendingToken, { messageStop: true, cacheRead: 0, P: 100, outputItems: [asst("done")], generation: "g1" });
+  const drifted = [user("fix"), { kind: "assistant", text: "done", status: "completed" }];
+  const d = decide(store, { ...base, effort: "low", parent: drifted, suffix: [user("second")] }, ON);
+  assert.notEqual(d.kind, "matched");
 });

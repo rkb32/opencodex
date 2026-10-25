@@ -22,13 +22,33 @@ function canonical(value) {
   return value;
 }
 const stableJson = (value) => JSON.stringify(canonical(value));
+// The one projection used for commit and lookup (section 6). Key order is canonical; nothing else is dropped.
+export const project = (items) => canonical(items);
 export const hash = (value) => createHash("sha256").update(stableJson(value)).digest("hex");
 const bytesOf = (value) => Buffer.byteLength(stableJson(value));
 
 // Section 6: minimal maps to low, so the two are not a change point.
+// Section 6: `minimal` maps to `low` for adaptive output, as in anthropic.ts adaptiveEffort (L612).
 export const mapEffort = (effort) => (effort === "minimal" ? "low" : effort);
 
+// Reasoning budget by effort (anthropic.ts reasoningBudget, L599).
+const BUDGET = { minimal: 1024, low: 4096, medium: 8192, high: 16384, xhigh: 24576, max: 32000 };
+// Effective output limit for this request (section 6). An explicit client cap is used as sent.
+// Otherwise the adaptive derivation: max(omitted, min(40192, max(8192, budget + 8192))).
+export function effectiveLimit(req) {
+  if (req.explicitCap !== undefined) return req.explicitCap;
+  // The budget is derived from the mapped effort (anthropic.ts L1110–1113: wantBudget uses adaptiveEffort).
+  const budget = BUDGET[mapEffort(req.effort)] ?? 8192;
+  return Math.max(req.omittedMaxTokens ?? 8192, Math.min(40192, Math.max(8192, budget + 8192)));
+}
+
 const off = (reason, extra = {}) => ({ action: "off", reason, ...extra });
+
+// Proposed exact fragment for "names the beta or effort message" (section 13.2a, owner to confirm).
+// The beta's own name. Anything else in a 400 sets nothing.
+export const BETA_FRAGMENT = "mid-conversation-output-config";
+// Capability is per model and destination, not per chat or credential (section 3a).
+const capabilityKey = (s) => hash({ model: s.model, destination: s.destination });
 
 export function createStore() {
   return { entries: new Map(), pending: new Map(), capability: new Map(), committedInputs: new Map(), nextVersion: 1 };
@@ -84,6 +104,8 @@ export function decide(store, req, opts = {}) {
   if (opts.activated !== true) return off("not-activated");
   if (req.transport === "websocket" && opts.websocketHeaderRead !== true) return off("websocket-before-activation");
 
+  // Fable 5.1 is in scope only once its wire ID is checked against the Mythos rule; until then off.
+  if (/fable/i.test(req.scope?.model ?? "")) return off("fable-wire-id-unchecked");
   // Rule 2: every scope part is required.
   const s = req.scope;
   if (!s || SCOPE_PARTS.some((k) => !s[k])) return off("missing-scope");
@@ -100,7 +122,7 @@ export function decide(store, req, opts = {}) {
   if (req.stripped) return offSend(store, parentKey, "proxy-stripped");
 
   // Rule 3a: an unsupported capability record.
-  if (store.capability.get(hash(s)) === "unsupported") return offSend(store, parentKey, "capability-unsupported");
+  if (store.capability.get(capabilityKey(s)) === "unsupported") return offSend(store, parentKey, "capability-unsupported");
 
   // Rule 3b runs before rule 4: a thinking change on a matching parent.
   const parent = store.entries.get(parentKey);
@@ -147,9 +169,11 @@ export function decide(store, req, opts = {}) {
   if (!parent) {
     // Rule 7: a compaction summary is user-role; it never starts a history.
     if (req.compactionSummary === true) return off("compaction-summary");
+    // Activation condition 2: nothing starts a history until the compaction marker is identified.
+    if (opts.compactionMarkerIdentified !== true) return off("compaction-marker-unidentified");
     // Rules 5 and 7: no entry. A new history needs the positive new-chat signal, one user
     // message, and no tool or assistant items. A restart, eviction, or compaction is not new.
-    const newChat = opts.lineageSignal === true && req.parent.length === 0
+    const newChat = lineageFromMetadata(req.turnMetadata) && req.parent.length === 0
       && userCount === 1 && suffix.every((item) => isUser(item) || isDeveloper(item));
     if (!newChat) return off("no-history");
     if (store.entries.size + store.pending.size >= MAX_ENTRIES) {
@@ -170,7 +194,7 @@ export function decide(store, req, opts = {}) {
   if (parent.generation !== req.generation) return offSend(store, parentKey, "generation-mismatch");
 
   // Section 6: any output limit different from the anchor's is off.
-  if (req.limit !== parent.limit) return offSend(store, parentKey, "limit-differs");
+  if (effectiveLimit(req) !== parent.limit) return offSend(store, parentKey, "limit-differs");
 
   if (userCount > 1) return offSend(store, parentKey, "more-than-one-user-message");
 
@@ -285,6 +309,13 @@ function evictUntilFits(store, bytes) {
   return true;
 }
 
+function recordCommittedInput(store, slot) {
+  store.committedInputs.set(hash([slot.scopeKey, slot.inputHash]), true);
+  while (store.committedInputs.size > MAX_ENTRIES * 4) {
+    store.committedInputs.delete(store.committedInputs.keys().next().value);
+  }
+}
+
 // Outcomes after a send (section 9), in the contract's order.
 export function commit(store, token, result, now = Date.now()) {
   const slot = takeSlot(store, token);
@@ -293,14 +324,14 @@ export function commit(store, token, result, now = Date.now()) {
   const { req } = slot;
 
   if (result.failedBeforeSend) {
-    // Restore only the matched parent, unchanged, and only if the store can hold it again.
-    // A failed placeholder is deleted (no restore).
-    if (slot.kind === "matched") {
+    // Default: delete. Restore only the matched parent, and only when the owner has enabled it
+    // (section 13.4). A failed placeholder is always deleted.
+    if (slot.kind === "matched" && result.restoreOnFailure === true) {
       if (!evictUntilFits(store, slot.entry.bytes)) return { action: "dropped", reason: "over-store-cap" };
       store.entries.set(slot.key, slot.entry);
       return { action: "restored" };
     }
-    return { action: "deleted", reason: "placeholder-failed" };
+    return { action: "deleted", reason: slot.kind === "matched" ? "failed-before-send" : "placeholder-failed" };
   }
   if (!result.messageStop) return { action: "deleted", reason: "uncertain-outcome" };
 
@@ -309,7 +340,10 @@ export function commit(store, token, result, now = Date.now()) {
   if (slot.kind === "matched" && cacheRead < slot.entry.P) {
     return { action: "deleted", reason: "cache-below-P" };
   }
-  if (!(result.P > 0)) return { action: "not-committed", reason: "P-zero" };
+  if (!(result.P > 0)) {
+    if (slot.kind === "new") recordCommittedInput(store, slot);
+    return { action: "not-committed", reason: "P-zero" };
+  }
   // 3. Generation check: the generation at commit must equal the attempt's.
   // Section 9, step 4: the value at commit must equal both the lookup value and the attempt-start value.
   if (result.generation !== req.generation || result.generation !== slot.attemptGeneration) {
@@ -338,7 +372,7 @@ export function commit(store, token, result, now = Date.now()) {
     inputHash: slot.inputHash,
     effortInEffect,
     thinking: req.thinking,
-    limit: req.limit,
+    limit: effectiveLimit(req),
     changePoints,
     P: result.P,
     version: store.nextVersion++,
@@ -351,21 +385,18 @@ export function commit(store, token, result, now = Date.now()) {
   // Section 5(a): the change point sits before the user message, after any leading tool results.
   // Remember the committed input so a later retry of this turn is refused even after its entry is consumed.
   // Bounded: the oldest record goes first.
-  store.committedInputs.set(hash([slot.scopeKey, slot.inputHash]), true);
-  while (store.committedInputs.size > MAX_ENTRIES * 4) {
-    store.committedInputs.delete(store.committedInputs.keys().next().value);
-  }
+  recordCommittedInput(store, slot);
   store.entries.set(key, { ...record, bytes });
   return { action: "committed", key };
 }
 
 // A 400 from upstream (section 11). A 400 that names the beta or effort message sets the
 // capability record to unsupported and is not resent. Other errors delete the pending slot.
-export function rejectUpstream(store, token, { status, namesBetaOrEffort = false }) {
+export function rejectUpstream(store, token, { status, errorText = "" }) {
   const slot = takeSlot(store, token);
   if (!slot) return { action: "dropped", reason: "pending-missing" };
-  if (status === 400 && namesBetaOrEffort) {
-    store.capability.set(hash(slot.req.scope), "unsupported");
+  if (status === 400 && errorText.includes(BETA_FRAGMENT)) {
+    store.capability.set(capabilityKey(slot.req.scope), "unsupported");
     return { action: "off", reason: "capability-unsupported", deleted: true };
   }
   // Any other error (other 400, 5xx, transport failure): error to the caller, no resend, no capability record.
@@ -375,10 +406,10 @@ export function rejectUpstream(store, token, { status, namesBetaOrEffort = false
 // The client disconnected or the request was abandoned after the send: nothing is committed.
 // `sent` says whether any bytes reached the upstream. If not, a matched parent is restored (as in
 // the failed-before-send rule); if so, the parent is deleted.
-export function abandon(store, token, { sent = true } = {}) {
+export function abandon(store, token, { sent = true, restoreOnFailure = false } = {}) {
   const slot = takeSlot(store, token);
   if (!slot) return { action: "dropped", reason: "pending-missing" };
-  if (!sent && slot.kind === "matched") {
+  if (!sent && restoreOnFailure && slot.kind === "matched") {
     if (!evictUntilFits(store, slot.entry.bytes)) return { action: "dropped", reason: "over-store-cap" };
     store.entries.set(slot.key, slot.entry);
     return { action: "restored" };
