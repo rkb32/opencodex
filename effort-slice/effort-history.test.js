@@ -414,7 +414,7 @@ test("400 that names the beta or effort message: capability unsupported, no rese
   const store = createStore();
   const t = startChat(store, { effort: "low" });
   const d = decide(store, { ...base, effort: "low", parent: t, suffix: [user("next")] }, ON);
-  const res = rejectUpstream(store, d.pendingToken, { status: 400, errorText: "mid-conversation-output-config-2026-07-01 unsupported" });
+  const res = rejectUpstream(store, d.pendingToken, { status: 400, errorText: "output_config.effort requires a model that supports per-turn effort; this model does not" });
   assert.equal(res.reason, "capability-unsupported");
   assert.equal(store.entries.size, 0);
   const next = decide(store, { ...base, effort: "low", parent: t, suffix: [user("again")] }, ON);
@@ -825,7 +825,7 @@ test("capability is per model and destination: a beta 400 in one chat marks the 
   const store = createStore();
   const t = startChat(store, { effort: "low", text: "chat one" });
   const d = decide(store, { ...base, chatLineage: "chat-1", effort: "low", parent: t, suffix: [user("next")] }, ON);
-  rejectUpstream(store, d.pendingToken, { status: 400, errorText: "mid-conversation-output-config-2026-07-01 unsupported" });
+  rejectUpstream(store, d.pendingToken, { status: 400, errorText: "output_config.effort requires a model that supports per-turn effort; this model does not" });
   const other = decide(store, { ...base, chatLineage: "chat-2", effort: "low", parent: [], suffix: [user("another")] }, ON);
   assert.equal(other.reason, "capability-unsupported");
 });

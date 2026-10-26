@@ -44,9 +44,10 @@ export function effectiveLimit(req) {
 
 const off = (reason, extra = {}) => ({ action: "off", reason, ...extra });
 
-// Proposed exact fragment for "names the beta or effort message" (section 13.2a, owner to confirm).
-// The beta's own name. Anything else in a 400 sets nothing.
-export const BETA_FRAGMENT = "mid-conversation-output-config";
+// Documented 400 text for a model without per-message effort (Anthropic effort docs, read 2026-10-25):
+// "output_config.effort requires a model that supports per-turn effort; this model does not".
+// Anything else in a 400 sets nothing.
+export const BETA_FRAGMENT = "requires a model that supports per-turn effort";
 // Capability is per model and destination, not per chat or credential (section 3a).
 const capabilityKey = (s) => hash({ model: s.model, destination: s.destination });
 
