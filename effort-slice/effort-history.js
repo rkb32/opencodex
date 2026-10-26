@@ -24,6 +24,8 @@ function canonical(value) {
 const stableJson = (value) => JSON.stringify(canonical(value));
 // The one projection used for commit and lookup (section 6). Key order is canonical; nothing else is dropped.
 export const project = (items) => canonical(items);
+// Every item hash (lookup and commit) goes through project().
+const hashItems = (items) => hash(project(items));
 export const hash = (value) => createHash("sha256").update(stableJson(value)).digest("hex");
 const bytesOf = (value) => Buffer.byteLength(stableJson(value));
 
@@ -104,6 +106,9 @@ export function decide(store, req, opts = {}) {
   if (opts.enabled !== true) return off("switch-off");
   if (opts.activated !== true) return off("not-activated");
   if (req.transport === "websocket" && opts.websocketHeaderRead !== true) return off("websocket-before-activation");
+  // Rule 1: out of scope. Claude Messages requests and requests with previous_response_id are always off.
+  if (req.apiKind === "messages") return off("out-of-scope-messages-api");
+  if (req.previousResponseId) return off("out-of-scope-previous-response-id");
 
   // Fable 5.1 is in scope only once its wire ID is checked against the Mythos rule; until then off.
   if (/fable/i.test(req.scope?.model ?? "")) return off("fable-wire-id-unchecked");
@@ -114,9 +119,9 @@ export function decide(store, req, opts = {}) {
   // Without one, nothing is optimized (off), and entries and replay records are per chat.
   if (!req.chatLineage) return off("no-chat-lineage");
   const scopeKey = hash([s, req.chatLineage]);
-  const parentHash = hash(req.parent);
+  const parentHash = hashItems(req.parent);
   const parentKey = entryKey(scopeKey, parentHash);
-  const inputHash = hash([...req.parent, ...req.suffix]);
+  const inputHash = hashItems([...req.parent, ...req.suffix]);
 
   // Rule 2a: no cache breakpoint. Rule 3: the proxy stripped reasoning.
   if (!req.cacheControl) return offSend(store, parentKey, "no-cache-control");
@@ -364,7 +369,7 @@ export function commit(store, token, result, now = Date.now()) {
     : [];
   const effortInEffect = prior && !slot.changePoint ? prior.effortInEffect : effort;
 
-  const prefixHash = hash(items);
+  const prefixHash = hashItems(items);
   const record = {
     scopeKey: slot.scopeKey,
     frame: req.frame,
@@ -373,6 +378,7 @@ export function commit(store, token, result, now = Date.now()) {
     inputHash: slot.inputHash,
     effortInEffect,
     thinking: req.thinking,
+    budget: BUDGET[mapEffort(req.effort)] ?? 8192,
     limit: effectiveLimit(req),
     changePoints,
     P: result.P,

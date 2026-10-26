@@ -665,7 +665,7 @@ test("chat identity: no chat lineage means off, nothing written", () => {
   assert.equal(store.pending.size, 0);
 });
 
-test("positive control: a first answer then a second turn matches (projection parity)", () => {
+test("positive control on the same objects (shape check only; a real client echo is not tested)", () => {
   const store = createStore();
   let tr = startChat(store, { effort: "low" });
   const d = decide(store, { ...base, effort: "low", parent: tr, suffix: [user("second question")] }, ON);
@@ -679,7 +679,7 @@ test("projection miss: an output item the client drops makes the next turn off",
   assert.equal(d.reason, "no-history");
 });
 
-test("replaced request: a newer request takes the slot, and the older commit is dropped", () => {
+test("second request on the same slot is off and deletes it; the older commit is dropped", () => {
   const store = createStore();
   const t = startChat(store, { effort: "low" });
   const old = decide(store, { ...base, effort: "low", parent: t, suffix: [user("first")] }, { ...ON, now: 0 });
@@ -830,7 +830,7 @@ test("capability is per model and destination: a beta 400 in one chat marks the 
   assert.equal(other.reason, "capability-unsupported");
 });
 
-test("projection positive control over a wire round trip: the echoed answer matches", () => {
+test("positive control over a JSON round trip (shape check only; real id, status, phase are not tested)", () => {
   const store = createStore();
   const d0 = decide(store, { ...base, effort: "low", parent: [], suffix: [user("fix")] }, ON);
   const out = [asst("done")];
@@ -847,4 +847,45 @@ test("projection shape drift: an echo that adds a field misses, so the next turn
   const drifted = [user("fix"), { kind: "assistant", text: "done", status: "completed" }];
   const d = decide(store, { ...base, effort: "low", parent: drifted, suffix: [user("second")] }, ON);
   assert.notEqual(d.kind, "matched");
+});
+
+test("rule 1: a Messages API request is off", () => {
+  const d = decide(createStore(), { ...base, apiKind: "messages", effort: "low", parent: [], suffix: [user("hi")] }, ON);
+  assert.equal(d.reason, "out-of-scope-messages-api");
+});
+
+test("rule 1: a request with previous_response_id is off", () => {
+  const d = decide(createStore(), { ...base, previousResponseId: "resp_1", effort: "low", parent: [], suffix: [user("hi")] }, ON);
+  assert.equal(d.reason, "out-of-scope-previous-response-id");
+});
+
+test("the pinned thinking budget is stored on the record (section 10)", () => {
+  const store = createStore();
+  const t0 = startChat(store, { effort: "low" });
+  const entry = [...store.entries.values()][0];
+  assert.equal(entry.budget, 4096);
+  assert.ok(t0.length > 0);
+});
+
+test("store total: eviction fires when stored records near the cap (not only small records)", () => {
+  const store = createStore();
+  startChat(store, { effort: "low", text: "first" });
+  const first = [...store.entries.keys()][0];
+  store.entries.get(first).bytes = MAX_TOTAL_BYTES - 50;
+  const d = decide(store, { ...base, effort: "low", parent: [], suffix: [user("second")] }, ON);
+  const res = commit(store, d.pendingToken, { messageStop: true, cacheRead: 0, P: 100, outputItems: [asst("r")], generation: "g1" });
+  assert.equal(res.action, "committed");
+  assert.equal(store.entries.has(first), false);
+});
+
+test("restore with a full store: an older entry is evicted so the restored entry fits", () => {
+  const store = createStore();
+  startChat(store, { effort: "low", text: "other chat" });
+  const other = [...store.entries.keys()][0];
+  const t0 = startChat(store, { effort: "low", text: "keep" });
+  const d = decide(store, { ...base, effort: "low", parent: t0, suffix: [user("next")] }, ON);
+  store.entries.get(other).bytes = MAX_TOTAL_BYTES - 50;
+  const res = commit(store, d.pendingToken, { failedBeforeSend: true, restoreOnFailure: true });
+  assert.equal(res.action, "restored");
+  assert.equal(store.entries.has(other), false);
 });
