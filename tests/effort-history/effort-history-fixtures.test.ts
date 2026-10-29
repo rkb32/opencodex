@@ -1,0 +1,368 @@
+// Offline fixtures for the effort-history slice (#6895). Activation stays off: nothing here is wired
+// into a production request, and no network call is made. The real Anthropic adapter, Responses
+// parser and bridge produce every body and output item; the slice decides from those.
+import { describe, expect, test } from "bun:test";
+import { bridgeToResponsesSSE } from "../../src/bridge";
+import { createAnthropicAdapter } from "../../src/adapters/anthropic";
+import { parseRequest } from "../../src/responses/parser";
+import { isCompactionItemType } from "../../src/responses/compaction";
+import type { AdapterEvent, OcxProviderConfig } from "../../src/types";
+import { createTestTranslatorBudget, withTestTranslatorBudget } from "../helpers/translator-budget";
+// @ts-expect-error plain JS slice, no type declarations
+import { createStore, decide, commit, abandon, effectiveLimit, hashItems, kindOf, lineageFromMetadata } from "./effort-history.js";
+
+const MODEL = "claude-opus-5-5";
+const FIXED_MODEL = "claude-sonnet-4-5";
+const keyProvider = { adapter: "anthropic", baseUrl: "https://api.anthropic.com", apiKey: "sk-test" } as OcxProviderConfig;
+// A configured output budget above the adaptive ceiling (40192) keeps max_tokens constant across efforts.
+const pinnedProvider = { ...keyProvider, defaultMaxOutputTokens: 64000 } as OcxProviderConfig;
+const ON = { enabled: true, activated: true, compactionMarkerIdentified: true };
+const NEW_META = JSON.stringify({ history_initialization: "New" });
+const scope = {
+  cohort: "cohort-1", provider: "anthropic", destination: "api.anthropic.com",
+  adapter: "anthropic", model: MODEL, credential: "acct-1",
+};
+const INSTRUCTIONS = "You are a coding agent.";
+const TOOLS = [{ type: "function", name: "shell", description: "run a command", parameters: { type: "object", properties: { cmd: { type: "string" } } } }];
+
+const userMsg = (text: string) => ({ type: "message", role: "user", content: [{ type: "input_text", text }] });
+const frame = (type: string, data: Record<string, unknown>) => `event: ${type}\ndata: ${JSON.stringify({ type, ...data })}\n\n`;
+
+async function drain(stream: ReadableStream<Uint8Array>): Promise<string> {
+  const reader = stream.getReader();
+  const decoder = new TextDecoder();
+  let out = "";
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    out += decoder.decode(value, { stream: true });
+  }
+  return out;
+}
+
+function outputItemsOf(sse: string): Record<string, unknown>[] {
+  const items: Record<string, unknown>[] = [];
+  for (const line of sse.split("\n")) {
+    if (!line.startsWith("data: ")) continue;
+    try {
+      const json = JSON.parse(line.slice(6)) as { type?: string; item?: Record<string, unknown> };
+      if (json.type === "response.output_item.done" && json.item) items.push(json.item);
+    } catch { /* partial frame */ }
+  }
+  return items;
+}
+
+// The adapter that built the latest request parses its response, as one request does in the server
+// (its Opus 5.5 progress-update mode is set by buildRequest).
+let lastAdapter: ReturnType<typeof createAnthropicAdapter> | undefined;
+
+/** One Responses request through the real parser and Anthropic serializer. */
+async function serialize(input: unknown[], effort: string, opts: { model?: string; provider?: OcxProviderConfig; maxOutput?: number } = {}) {
+  const adapter = withTestTranslatorBudget(createAnthropicAdapter(opts.provider ?? keyProvider, "short"));
+  const responses = {
+    model: opts.model ?? MODEL, instructions: INSTRUCTIONS, tools: TOOLS, input, stream: true,
+    reasoning: { effort }, ...(opts.maxOutput !== undefined ? { max_output_tokens: opts.maxOutput } : {}),
+  };
+  const request = await adapter.buildRequest(parseRequest(responses), {} as never);
+  lastAdapter = adapter;
+  return JSON.parse(request.body) as Record<string, any>;
+}
+
+/** A synthetic Anthropic stream through the real adapter parser and the real Responses bridge. */
+async function respond(opts: { thinking?: string; text?: string; cacheRead?: number; stop?: boolean; model?: string } = {}) {
+  const frames = [
+    frame("message_start", { message: { id: "msg_up", usage: { input_tokens: 50, cache_read_input_tokens: opts.cacheRead ?? 0 } } }),
+    frame("content_block_start", { index: 0, content_block: { type: "thinking", thinking: "" } }),
+    frame("content_block_delta", { index: 0, delta: { type: "thinking_delta", thinking: opts.thinking ?? "look at it" } }),
+    frame("content_block_delta", { index: 0, delta: { type: "signature_delta", signature: "SigAbc1234567890==" } }),
+    frame("content_block_stop", { index: 0 }),
+    frame("content_block_start", { index: 1, content_block: { type: "text", text: "" } }),
+    frame("content_block_delta", { index: 1, delta: { type: "text_delta", text: opts.text ?? "done" } }),
+    frame("content_block_stop", { index: 1 }),
+    ...(opts.stop === false ? [] : [
+      frame("message_delta", { delta: { stop_reason: "end_turn" }, usage: { output_tokens: 5 } }),
+      frame("message_stop", {}),
+    ]),
+  ];
+  const adapter = lastAdapter ?? withTestTranslatorBudget(createAnthropicAdapter(keyProvider, "short"));
+  const events: AdapterEvent[] = [];
+  async function* tap() {
+    for await (const event of adapter.parseStream(new Response(frames.join(""), { headers: { "content-type": "text/event-stream" } }), createTestTranslatorBudget())) {
+      events.push(event);
+      yield event;
+    }
+  }
+  const sse = await drain(bridgeToResponsesSSE(tap(), opts.model ?? MODEL));
+  return { items: outputItemsOf(sse), sse, events, messageStop: sse.includes("\"response.completed\"") };
+}
+
+/** The slice request for one serialized turn. Every compared value is the emitted one. */
+function sliceRequest(input: unknown[], parentLength: number, body: Record<string, any>, effort: string, extra: Record<string, unknown> = {}) {
+  return {
+    chatLineage: "chat-1", scope, frame: "frame-A", generation: "g1",
+    cacheControl: JSON.stringify(body).includes("\"cache_control\""),
+    stripped: false,
+    thinking: body.thinking,
+    explicitCap: body.max_tokens,
+    effort,
+    turnMetadata: parentLength === 0 ? NEW_META : undefined,
+    transport: "http",
+    parent: input.slice(0, parentLength),
+    suffix: input.slice(parentLength),
+    ...extra,
+  };
+}
+
+/** Turn 1 of a chat, committed with the real output items. Returns what the client now holds. */
+async function firstTurn(store: ReturnType<typeof createStore>, opts: { provider?: OcxProviderConfig; effort?: string; text?: string } = {}) {
+  const input = [userMsg(opts.text ?? "fix the bug")];
+  const effort = opts.effort ?? "high";
+  const body = await serialize(input, effort, { provider: opts.provider ?? pinnedProvider });
+  const d = decide(store, sliceRequest(input, 0, body, effort), ON);
+  expect(d.action).toBe("send");
+  const reply = await respond();
+  expect(commit(store, d.pendingToken, { messageStop: reply.messageStop, cacheRead: 0, P: 100, outputItems: reply.items, generation: "g1" }).action).toBe("committed");
+  return { body, transcript: [...input, ...reply.items], reply };
+}
+
+// Strip cache breakpoints and normalize string content, so two serializations compare by content.
+function contentOf(messages: Array<Record<string, any>>) {
+  return messages.map(m => ({
+    role: m.role,
+    content: (typeof m.content === "string" ? [{ type: "text", text: m.content }] : m.content)
+      .map(({ cache_control: _cc, ...block }: Record<string, unknown>) => block),
+  }));
+}
+
+describe("positive control: serializer to next request", () => {
+  test("echoed output rebuilds the same prefix, and the slice matches it as a change point", async () => {
+    const store = createStore();
+    const { body: body1, transcript, reply } = await firstTurn(store);
+    const input2 = [...transcript, userMsg("now the tests")];
+    const body2 = await serialize(input2, "low", { provider: pinnedProvider });
+
+    // The prefix content is unchanged: turn 1's user message, then the assistant turn rebuilt from
+    // the echoed output (signed thinking, then the final text).
+    expect(contentOf(body2.messages.slice(0, 1))).toEqual(contentOf(body1.messages));
+    expect(contentOf([body2.messages[1]])).toEqual([{ role: "assistant", content: [
+      { type: "thinking", thinking: "look at it", signature: "SigAbc1234567890==" },
+      { type: "text", text: "done" },
+    ] }]);
+    // The output the client echoes is proxy-minted: reasoning and message ids, and the ocxr1 envelope.
+    // Opus 5.5 progress updates add a commentary message before the final answer.
+    expect(reply.items.map(i => [kindOf(i), i.phase])).toEqual([["other:reasoning", undefined], ["assistant", "commentary"], ["assistant", "final_answer"]]);
+    expect(String(reply.items[0].encrypted_content)).toStartWith("ocxr1:");
+
+    // Today the effort change rewrites the top-level field, which is what breaks the cache.
+    expect(body1.output_config).toEqual({ effort: "high" });
+    expect(body2.output_config).toEqual({ effort: "low" });
+    // Adaptive thinking emits no budget_tokens, so the emitted thinking field is unchanged.
+    expect(body2.thinking).toEqual(body1.thinking);
+    expect(body2.max_tokens).toBe(body1.max_tokens);
+
+    const d = decide(store, sliceRequest(input2, transcript.length, body2, "low"), ON);
+    expect(d).toMatchObject({ action: "send", kind: "matched", changePoint: true, shape: "a", insert: { at: transcript.length, effort: "low" } });
+  });
+
+  test("the slice's derived output limit equals the serializer's max_tokens for every effort", async () => {
+    for (const effort of ["minimal", "low", "medium", "high", "xhigh", "max"]) {
+      const body = await serialize([userMsg("x")], effort);
+      expect(effectiveLimit({ effort })).toBe(body.max_tokens);
+    }
+  });
+});
+
+describe("eligibility from emitted fields", () => {
+  test("omitted cap (Codex default): max_tokens follows effort, so every effort change is off", async () => {
+    const store = createStore();
+    const { body: body1, transcript } = await firstTurn(store, { provider: keyProvider });
+    const input2 = [...transcript, userMsg("now the tests")];
+    const body2 = await serialize(input2, "low");
+    expect([body1.max_tokens, body2.max_tokens]).toEqual([24576, 12288]);
+    expect(decide(store, sliceRequest(input2, transcript.length, body2, "low"), ON)).toMatchObject({ action: "off", reason: "limit-differs" });
+  });
+
+  test("explicit caller cap: unchanged limit, so the change point is admitted", async () => {
+    const store = createStore();
+    const input = [userMsg("fix the bug")];
+    const body1 = await serialize(input, "high", { maxOutput: 32000 });
+    const d1 = decide(store, sliceRequest(input, 0, body1, "high"), ON);
+    const reply = await respond();
+    commit(store, d1.pendingToken, { messageStop: true, cacheRead: 0, P: 100, outputItems: reply.items, generation: "g1" });
+    const input2 = [...input, ...reply.items, userMsg("next")];
+    const body2 = await serialize(input2, "low", { maxOutput: 32000 });
+    expect(body2.max_tokens).toBe(32000);
+    expect(decide(store, sliceRequest(input2, input.length + reply.items.length, body2, "low"), ON)).toMatchObject({ kind: "matched", changePoint: true });
+  });
+
+  test("fixed-budget branch: the emitted budget_tokens changes with effort, so it is a thinking change", async () => {
+    const store = createStore();
+    const input = [userMsg("fix the bug")];
+    const body1 = await serialize(input, "high", { model: FIXED_MODEL, maxOutput: 40000 });
+    const fixedScope = { ...scope, model: FIXED_MODEL };
+    const d1 = decide(store, sliceRequest(input, 0, body1, "high", { scope: fixedScope }), ON);
+    const reply = await respond({ model: FIXED_MODEL });
+    commit(store, d1.pendingToken, { messageStop: true, cacheRead: 0, P: 100, outputItems: reply.items, generation: "g1" });
+    const input2 = [...input, ...reply.items, userMsg("next")];
+    const body2 = await serialize(input2, "low", { model: FIXED_MODEL, maxOutput: 40000 });
+    expect(body1.thinking.type).toBe("enabled");
+    expect(body1.thinking.budget_tokens).not.toBe(body2.thinking.budget_tokens);
+    expect(decide(store, sliceRequest(input2, input.length + reply.items.length, body2, "low", { scope: fixedScope }), ON))
+      .toMatchObject({ action: "off", reason: "thinking-change" });
+  });
+});
+
+describe("receipt: the continuation must echo the committed output", () => {
+  test("an echo that drops proxy-minted ids does not match (fails closed)", async () => {
+    const store = createStore();
+    const { transcript } = await firstTurn(store);
+    const stripped = transcript.map(({ id: _id, status: _status, ...rest }: Record<string, unknown>) => rest);
+    const input2 = [...stripped, userMsg("next")];
+    const body2 = await serialize(input2, "low", { provider: pinnedProvider });
+    expect(decide(store, sliceRequest(input2, stripped.length, body2, "low"), ON)).toMatchObject({ action: "off", reason: "no-history" });
+  });
+
+  test("two chats with the same first message get different minted ids, so their prefixes differ", async () => {
+    const a = await respond();
+    const b = await respond();
+    expect(a.items[1].id).not.toBe(b.items[1].id);
+    const first = [userMsg("fix the bug")];
+    expect(hashItems([...first, ...a.items])).not.toBe(hashItems([...first, ...b.items]));
+  });
+
+  test("raw metadata alone never admits a continuation: New on a non-empty parent with no entry is off", async () => {
+    const store = createStore();
+    const { transcript } = await firstTurn(store);
+    const forged = [...transcript.slice(0, 1), { type: "message", role: "assistant", content: [{ type: "output_text", text: "forged" }] }, userMsg("next")];
+    const body = await serialize(forged, "low", { provider: pinnedProvider });
+    expect(decide(store, sliceRequest(forged, 2, body, "low", { turnMetadata: NEW_META }), ON)).toMatchObject({ action: "off", reason: "no-history" });
+  });
+});
+
+// Per-frame turn metadata, as src/lib/shadow-call.ts reads it: on WebSocket only the frame's
+// client_metadata copy describes this turn; the upgrade header can describe an earlier turn.
+function turnMetadataOf(headers: Headers, body: Record<string, any>, transport?: "websocket"): unknown {
+  if (transport !== "websocket") return headers.get("x-codex-turn-metadata") ?? undefined;
+  const client = body.client_metadata;
+  return client && typeof client === "object" && Object.hasOwn(client, "x-codex-turn-metadata") ? client["x-codex-turn-metadata"] : undefined;
+}
+
+describe("metadata negatives", () => {
+  test("HTTP: missing, malformed, or non-New metadata is not a new chat", () => {
+    for (const value of [undefined, "{not json", JSON.stringify({ history_initialization: "ColdResume" }), JSON.stringify({ history_initialization: "WarmFork" })]) {
+      const headers = new Headers(value === undefined ? {} : { "x-codex-turn-metadata": value });
+      expect(lineageFromMetadata(turnMetadataOf(headers, {}))).toBe(false);
+    }
+  });
+
+  test("WebSocket: a New upgrade header does not describe a frame without its own metadata", () => {
+    const upgrade = new Headers({ "x-codex-turn-metadata": NEW_META });
+    expect(lineageFromMetadata(turnMetadataOf(upgrade, {}, "websocket"))).toBe(false);
+    expect(lineageFromMetadata(turnMetadataOf(upgrade, { client_metadata: { "x-codex-turn-metadata": NEW_META } }, "websocket"))).toBe(true);
+  });
+
+  test("WebSocket before activation is off regardless of metadata", async () => {
+    const input = [userMsg("hi")];
+    const body = await serialize(input, "high", { provider: pinnedProvider });
+    expect(decide(createStore(), sliceRequest(input, 0, body, "high", { transport: "websocket" }), ON)).toMatchObject({ reason: "websocket-before-activation" });
+  });
+});
+
+describe("compaction", () => {
+  test("both compaction item types are recognized by the parser and never start or extend a history", async () => {
+    expect(isCompactionItemType("compaction")).toBe(true);
+    expect(isCompactionItemType("context_compaction")).toBe(true);
+    for (const marker of [{ type: "context_compaction" }, { type: "compaction", encrypted_content: "ocx1:c3VtbWFyeQ==" }]) {
+      const store = createStore();
+      const { transcript } = await firstTurn(store);
+      // New history after compaction: marker plus summary, then the next user message.
+      const compacted = [marker, userMsg("summary of earlier work"), userMsg("continue")];
+      const body = await serialize(compacted, "low", { provider: pinnedProvider });
+      expect(decide(store, sliceRequest(compacted, 0, body, "low"), ON)).toMatchObject({ action: "off", reason: "no-history" });
+      // A marker appended to a matched parent is an unclassified suffix: off, and the parent is deleted.
+      const appended = [...transcript, marker, userMsg("continue")];
+      const body2 = await serialize(appended, "low", { provider: pinnedProvider });
+      expect(decide(store, sliceRequest(appended, transcript.length, body2, "low"), ON))
+        .toMatchObject({ action: "off", reason: "unclassified-suffix", deleted: true });
+      expect(store.entries.size).toBe(0);
+    }
+  });
+});
+
+describe("concurrent forks", () => {
+  test("two sends on one parent: the second collides, both are dropped, and the parent is gone", async () => {
+    const store = createStore();
+    const { transcript } = await firstTurn(store);
+    const forkA = [...transcript, userMsg("branch A")];
+    const forkB = [...transcript, userMsg("branch B")];
+    const a = decide(store, sliceRequest(forkA, transcript.length, await serialize(forkA, "low", { provider: pinnedProvider }), "low"), ON);
+    const b = decide(store, sliceRequest(forkB, transcript.length, await serialize(forkB, "low", { provider: pinnedProvider }), "low"), ON);
+    expect(a.kind).toBe("matched");
+    expect(b).toMatchObject({ action: "off", reason: "in-flight-collision", deleted: true });
+    const replyA = await respond({ text: "A" });
+    expect(commit(store, a.pendingToken, { messageStop: true, cacheRead: 100, P: 100, outputItems: replyA.items, generation: "g1" }))
+      .toMatchObject({ action: "dropped", reason: "pending-missing" });
+    expect(decide(store, sliceRequest(forkA, transcript.length, await serialize(forkA, "low", { provider: pinnedProvider }), "low"), ON)).toMatchObject({ reason: "no-history" });
+  });
+});
+
+describe("ambiguous sends", () => {
+  test("a stream cut before message_stop is not committed, and the parent is not restored", async () => {
+    const store = createStore();
+    const { transcript } = await firstTurn(store);
+    const input2 = [...transcript, userMsg("next")];
+    const body2 = await serialize(input2, "low", { provider: pinnedProvider });
+    const d = decide(store, sliceRequest(input2, transcript.length, body2, "low"), ON);
+    const cut = await respond({ stop: false });
+    expect(cut.messageStop).toBe(false);
+    expect(commit(store, d.pendingToken, { messageStop: cut.messageStop, cacheRead: 100, P: 100, outputItems: cut.items, generation: "g1" }))
+      .toMatchObject({ action: "deleted", reason: "uncertain-outcome" });
+    expect(decide(store, sliceRequest(input2, transcript.length, body2, "low"), ON)).toMatchObject({ action: "off" });
+  });
+
+  test("a client disconnect after the send deletes the parent by default", async () => {
+    const store = createStore();
+    const { transcript } = await firstTurn(store);
+    const input2 = [...transcript, userMsg("next")];
+    const d = decide(store, sliceRequest(input2, transcript.length, await serialize(input2, "low", { provider: pinnedProvider }), "low"), ON);
+    expect(abandon(store, d.pendingToken, { sent: true })).toMatchObject({ action: "deleted", reason: "abandoned" });
+    expect(store.entries.size).toBe(0);
+  });
+});
+
+describe("stale credential generations", () => {
+  test("a rotated generation before the next turn is off, and the parent is deleted", async () => {
+    const store = createStore();
+    const { transcript } = await firstTurn(store);
+    const input2 = [...transcript, userMsg("next")];
+    const body2 = await serialize(input2, "low", { provider: pinnedProvider });
+    expect(decide(store, sliceRequest(input2, transcript.length, body2, "low", { generation: "g2" }), ON))
+      .toMatchObject({ action: "off", reason: "generation-mismatch", deleted: true });
+    expect(store.entries.size).toBe(0);
+  });
+
+  test("a generation that rotates while the send is in flight is not committed", async () => {
+    const store = createStore();
+    const { transcript } = await firstTurn(store);
+    const input2 = [...transcript, userMsg("next")];
+    const d = decide(store, sliceRequest(input2, transcript.length, await serialize(input2, "low", { provider: pinnedProvider }), "low"), ON);
+    const reply = await respond({ cacheRead: 100 });
+    expect(commit(store, d.pendingToken, { messageStop: true, cacheRead: 100, P: 100, outputItems: reply.items, generation: "g2" }))
+      .toMatchObject({ action: "deleted", reason: "generation-changed" });
+  });
+});
+
+describe("retained transcript bytes", () => {
+  const secrets = ["fix the bug", "look at it", "SigAbc1234567890", "ocxr1:", "now the tests"];
+  const dump = (store: unknown) => JSON.stringify(store, (_k, v) => (v instanceof Map ? [...v.entries()] : v));
+
+  test("neither a pending slot nor a committed entry holds transcript text", async () => {
+    const store = createStore();
+    const { transcript } = await firstTurn(store);
+    const input2 = [...transcript, userMsg("now the tests")];
+    decide(store, sliceRequest(input2, transcript.length, await serialize(input2, "low", { provider: pinnedProvider }), "low"), ON);
+    expect(store.pending.size).toBe(1);
+    const text = dump(store);
+    for (const secret of secrets) expect(text).not.toContain(secret);
+  });
+});
