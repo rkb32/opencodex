@@ -11,7 +11,14 @@ export const MAX_BUFFER_BYTES = 128 * 1024;
 export const MAX_CHANGE_POINTS = 64;
 export const ENTRY_TTL_MS = 60 * 60 * 1000; // 1 hour from last use (section 12)
 export const PENDING_TTL_MS = 10 * 60 * 1000; // proposed fixture policy, not accepted by the owner
-export const SCOPE_PARTS = ["cohort", "provider", "destination", "adapter", "model", "credential"];
+export const SCOPE_PARTS = ["cohort", "provider", "destination", "adapter", "model", "credential", "authMode"];
+// Section 2: api.anthropic.com only, six models. Fable 5.1 stays off until its wire ID is checked.
+const IN_SCOPE_MODEL = /^(claude-)?(mythos-5-1|opus-5-5|opus-5|sonnet-5-5|haiku-5-5)$/;
+const ENDPOINT = "api.anthropic.com";
+// Effort names the serializer can emit (anthropic.ts adaptiveEffort / reasoningBudget).
+const EFFORTS = new Set(["minimal", "low", "medium", "high", "xhigh", "max"]);
+// Activation gates: no request reached the upstream path, so nothing is deleted.
+const GATE_REASONS = new Set(["switch-off", "not-activated", "websocket-before-activation"]);
 
 // Canonical JSON: object keys sorted at every level, so equal content hashes equally.
 function canonical(value) {
@@ -41,6 +48,7 @@ const BUDGET = { minimal: 1024, low: 4096, medium: 8192, high: 16384, xhigh: 245
 // Effective output limit for this request (section 6). An explicit client cap is used as sent.
 // Otherwise the adaptive derivation: max(omitted, min(40192, max(8192, budget + 8192))).
 export function effectiveLimit(req) {
+  if (req.emittedMaxTokens !== undefined) return req.emittedMaxTokens;
   if (req.explicitCap !== undefined) return req.explicitCap;
   // The budget is derived from the mapped effort (anthropic.ts L1110–1113: wantBudget uses adaptiveEffort).
   const budget = BUDGET[mapEffort(req.effort)] ?? 8192;
@@ -82,7 +90,7 @@ export function lineageFromMetadata(headerValue) {
 // Tool output types the parser handles (src/responses/parser.ts L293, L571, L621 at fdc6dd82).
 const TOOL_OUTPUTS = new Set(["function_call_output", "custom_tool_call_output", "tool_search_output"]);
 export function kindOf(item) {
-  if (typeof item?.kind === "string") return item.kind;
+  if (typeof item?.kind === "string" && item.type === undefined && item.role === undefined) return item.kind;
   const type = item?.type ?? (item?.role ? "message" : undefined);
   if (type === "message") {
     if (item.role === "user") return "user";
@@ -115,8 +123,22 @@ function sweep(store, now) {
   }
 }
 
+function dropParent(store, req) {
+  const s = req.scope;
+  if (!s || !req.chatLineage || !Array.isArray(req.parent)) return;
+  const key = entryKey(hash([s, req.chatLineage]), hashItems(req.parent));
+  store.entries.delete(key);
+  store.pending.delete(key);
+}
+
+function decideWithCleanup(store, req, opts) {
+  const result = decideInner(store, req, opts);
+  if (result.action === "off" && !GATE_REASONS.has(result.reason)) dropParent(store, req);
+  return result;
+}
+
 // Ordered algorithm, section 7. The first rule that decides wins.
-export function decide(store, req, opts = {}) {
+function decideInner(store, req, opts = {}) {
   const now = opts.now ?? Date.now();
   sweep(store, now);
 
@@ -131,10 +153,13 @@ export function decide(store, req, opts = {}) {
   // Fable 5.1 is in scope only once its wire ID is checked against the Mythos rule; until then off.
   if (/fable/i.test(req.scope?.model ?? "")) return off("fable-wire-id-unchecked");
   // No effort level ("none" or absent) cannot be a per-message effort value: off, as today.
-  if (typeof req.effort !== "string" || req.effort === "none") return off("no-effort-level");
+  if (typeof req.effort !== "string" || !EFFORTS.has(req.effort)) return off("no-effort-level");
   // Rule 2: every scope part is required.
   const s = req.scope;
   if (!s || SCOPE_PARTS.some((k) => !s[k])) return off("missing-scope");
+  if (s.authMode !== "apiKey") return off("oauth-not-in-first-slice");
+  if (s.destination !== ENDPOINT) return off("out-of-scope-destination");
+  if (typeof s.model !== "string" || !IN_SCOPE_MODEL.test(s.model)) return off("out-of-scope-model");
   // Chat identity: two chats can share a first message, so each chat needs its own lineage value.
   // Without one, nothing is optimized (off), and entries and replay records are per chat.
   if (!req.chatLineage) return off("no-chat-lineage");
@@ -214,7 +239,7 @@ export function decide(store, req, opts = {}) {
     store.pending.set(placeholder, {
       kind: "new", key: placeholder, token, version, createdAt: now, inputHash, scopeKey, req: pin(req), attemptGeneration: req.generation,
     });
-    return { action: "send", kind: "new", pendingToken: token };
+    return { action: "send", kind: "new", pendingToken: token, anchorEffort: mapEffort(req.effort) };
   }
 
   // Rule 6: frame and generation.
@@ -258,6 +283,7 @@ function admitMatched(store, plan) {
     action: "send",
     kind: "matched",
     pendingToken: token,
+    anchorEffort: plan.parent.anchorEffort,
     changePoint: plan.changePoint,
     shape: plan.shape,
     // What the adapter inserts for the change point: an effort-only system message at this position.
@@ -287,6 +313,7 @@ function totalBytes(store) {
 
 // Resolve a token to its slot without removing it. A token from an earlier admission does not match.
 function peekSlot(store, token) {
+  if (typeof token !== "string") return null;
   const sep = token.lastIndexOf(":");
   if (sep < 0) return null;
   const key = token.slice(0, sep);
@@ -312,9 +339,13 @@ function leastRecentlyUsed(store) {
 
 // Streaming: buffered output for a pending slot. If it would push the store past 512 KB, the slot
 // is deleted and nothing commits; the response itself is not interrupted (section 12).
-export function buffer(store, token, bytes) {
+function bufferInner(store, token, bytes) {
   const slot = peekSlot(store, token);
   if (!slot) return { action: "dropped", reason: "pending-missing" };
+  if (!Number.isFinite(bytes) || bytes < 0) {
+    store.pending.delete(slot.key);
+    return { action: "deleted", reason: "bad-bytes" };
+  }
   if (totalBytes(store) + bytes > MAX_TOTAL_BYTES) {
     store.pending.delete(slot.key);
     return { action: "deleted", reason: "streaming-over-store-cap" };
@@ -349,12 +380,14 @@ function recordCommittedInput(store, slot) {
 }
 
 // Outcomes after a send (section 9), in the contract's order.
-export function commit(store, token, result, now = Date.now()) {
+function commitInner(store, token, result, now = Date.now()) {
   const slot = takeSlot(store, token);
   if (!slot) return { action: "dropped", reason: "pending-missing" };
   if (now - slot.createdAt > PENDING_TTL_MS) return { action: "dropped", reason: "pending-expired" };
+  if (!result || typeof result !== "object") return { action: "deleted", reason: "bad-result" };
   const { req } = slot;
 
+  if (result.messageStop && !result.failedBeforeSend && !Array.isArray(result.outputItems)) return { action: "deleted", reason: "bad-output" };
   if (result.failedBeforeSend) {
     // Default: delete. Restore only the matched parent, and only when the owner has enabled it
     // (section 13.4). A failed placeholder is always deleted.
@@ -369,7 +402,8 @@ export function commit(store, token, result, now = Date.now()) {
 
   // 2. Cache check. A missing cache read counts as zero.
   const cacheRead = result.cacheRead ?? 0;
-  if (slot.kind === "matched" && cacheRead < slot.entry.P) {
+  // NaN or a non-number is not a cache read at or above P: fail closed.
+  if (slot.kind === "matched" && !(cacheRead >= slot.entry.P)) {
     return { action: "deleted", reason: "cache-below-P" };
   }
   if (!(result.P > 0)) {
@@ -402,6 +436,7 @@ export function commit(store, token, result, now = Date.now()) {
     prefixHash,
     inputHash: slot.inputHash,
     effortInEffect,
+    anchorEffort: prior ? prior.anchorEffort : effort,
     thinking: req.thinking,
     budget: BUDGET[mapEffort(req.effort)] ?? 8192,
     limit: effectiveLimit(req),
@@ -425,10 +460,10 @@ export function commit(store, token, result, now = Date.now()) {
 
 // A 400 from upstream (section 11). A 400 that names the beta or effort message sets the
 // capability record to unsupported and is not resent. Other errors delete the pending slot.
-export function rejectUpstream(store, token, { status, errorText = "" }) {
+function rejectInner(store, token, { status, errorText = "" } = {}) {
   const slot = takeSlot(store, token);
   if (!slot) return { action: "dropped", reason: "pending-missing" };
-  if (status === 400 && errorText.includes(BETA_FRAGMENT)) {
+  if (status === 400 && typeof errorText === "string" && errorText.includes(BETA_FRAGMENT)) {
     store.capability.set(capabilityKey(slot.req.scope), "unsupported");
     return { action: "off", reason: "capability-unsupported", deleted: true };
   }
@@ -439,7 +474,7 @@ export function rejectUpstream(store, token, { status, errorText = "" }) {
 // The client disconnected or the request was abandoned after the send: nothing is committed.
 // `sent` says whether any bytes reached the upstream. If not, a matched parent is restored (as in
 // the failed-before-send rule); if so, the parent is deleted.
-export function abandon(store, token, { sent = true, restoreOnFailure = false } = {}) {
+function abandonInner(store, token, { sent = true, restoreOnFailure = false } = {}) {
   const slot = takeSlot(store, token);
   if (!slot) return { action: "dropped", reason: "pending-missing" };
   if (!sent && restoreOnFailure && slot.kind === "matched") {
@@ -455,9 +490,32 @@ export function abandon(store, token, { sent = true, restoreOnFailure = false } 
 function pin(req) {
   return {
     scope: req.scope, effort: req.effort, thinking: req.thinking, explicitCap: req.explicitCap, callerCap: req.callerCap,
-    omittedMaxTokens: req.omittedMaxTokens, frame: req.frame, generation: req.generation, changeAt: changePointAt(req),
+    emittedMaxTokens: req.emittedMaxTokens, omittedMaxTokens: req.omittedMaxTokens,
+    frame: req.frame, generation: req.generation, changeAt: changePointAt(req),
   };
 }
+
+function guarded(fn, onError) {
+  return (...args) => {
+    try {
+      return fn(...args);
+    } catch {
+      return onError(...args);
+    }
+  };
+}
+function takeOrIgnore(store, token) {
+  try {
+    takeSlot(store, token);
+  } catch {
+    // A malformed store is left as it is; the caller gets a fail-closed result.
+  }
+}
+export const decide = guarded(decideWithCleanup, () => off("internal-error"));
+export const commit = guarded(commitInner, (store, token) => { takeOrIgnore(store, token); return { action: "deleted", reason: "internal-error" }; });
+export const buffer = guarded(bufferInner, (store, token) => { takeOrIgnore(store, token); return { action: "deleted", reason: "internal-error" }; });
+export const rejectUpstream = guarded(rejectInner, (store, token) => { takeOrIgnore(store, token); return { action: "error", reason: "internal-error", deleted: true }; });
+export const abandon = guarded(abandonInner, (store, token) => { takeOrIgnore(store, token); return { action: "deleted", reason: "internal-error" }; });
 
 // Section 5(a): the change point goes after the leading tool results, before the user message.
 // Returned as an index into the request input array (the parent items come first).

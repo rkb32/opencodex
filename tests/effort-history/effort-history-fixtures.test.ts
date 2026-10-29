@@ -12,7 +12,7 @@ import { createTestTranslatorBudget, withTestTranslatorBudget } from "../helpers
 import { createStore, decide, commit, abandon, effectiveLimit, hashItems, kindOf, lineageFromMetadata } from "./effort-history.js";
 
 const MODEL = "claude-opus-5-5";
-const FIXED_MODEL = "claude-sonnet-4-5";
+const FIXED_MODEL = "claude-mythos-5-1";
 const keyProvider = { adapter: "anthropic", baseUrl: "https://api.anthropic.com", apiKey: "sk-test" } as OcxProviderConfig;
 // A configured output budget above the adaptive ceiling (40192) keeps max_tokens constant across efforts.
 const pinnedProvider = { ...keyProvider, defaultMaxOutputTokens: 64000 } as OcxProviderConfig;
@@ -20,7 +20,7 @@ const ON = { enabled: true, activated: true, compactionMarkerIdentified: true };
 const NEW_META = JSON.stringify({ history_initialization: "New" });
 const scope = {
   cohort: "cohort-1", provider: "anthropic", destination: "api.anthropic.com",
-  adapter: "anthropic", model: MODEL, credential: "acct-1",
+  adapter: "anthropic", model: MODEL, credential: "acct-1", authMode: "apiKey",
 };
 const INSTRUCTIONS = "You are a coding agent.";
 const TOOLS = [{ type: "function", name: "shell", description: "run a command", parameters: { type: "object", properties: { cmd: { type: "string" } } } }];
@@ -103,7 +103,7 @@ function sliceRequest(input: unknown[], parentLength: number, body: Record<strin
     cacheControl: JSON.stringify(body).includes("\"cache_control\""),
     stripped: false,
     thinking: body.thinking,
-    explicitCap: body.max_tokens,
+    emittedMaxTokens: body.max_tokens,
     effort,
     turnMetadata: parentLength === 0 ? NEW_META : undefined,
     transport: "http",
@@ -391,7 +391,8 @@ describe("proposal: limit rule on the caller's cap only (owner decides)", () => 
     const d2 = decide(store, sliceRequest(input2, input.length + reply.items.length, today, "low"), CALLER_CAP);
     expect(d2).toMatchObject({ kind: "matched", changePoint: true, insert: { effort: "low" } });
 
-    const sent = applyEffortHistory(today, "high", "low");
+    expect(d2.anchorEffort).toBe("high");
+    const sent = applyEffortHistory(today, d2.anchorEffort, "low");
     expect(sent.max_tokens).toBe(12288); // not raised to the anchor's 24576
     expect(sent.output_config).toEqual(body1.output_config);
     expect(sent.thinking).toEqual(body1.thinking);
