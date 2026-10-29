@@ -512,3 +512,38 @@ describe("projection: dropped and orphan items (round 13)", () => {
     expect(d2.action).toBe("off");
   });
 });
+
+// Round 13: the real WebSocket functions, not a copy of their logic.
+import { prepareCodexWsRequest, CODEX_RESPONSES_HTTP_URL } from "../../src/server/responses/codex-ws-request";
+import { shadowCallPreservesSelectedModel } from "../../src/lib/shadow-call";
+
+describe("real WebSocket metadata functions (round 13)", () => {
+  test("the canonical WS path copies an upgrade-time turn-metadata header into a frame that has none", () => {
+    const upgradeMeta = JSON.stringify({ history_initialization: "New" });
+    const prepared = prepareCodexWsRequest(CODEX_RESPONSES_HTTP_URL, {
+      method: "POST",
+      headers: { "x-codex-turn-metadata": upgradeMeta, "content-type": "application/json" },
+      body: JSON.stringify({ model: "gpt-5", input: [], client_metadata: {} }),
+    } as RequestInit);
+    expect(prepared).not.toBeNull();
+    const frame = JSON.parse(prepared!.frameText);
+    expect(frame.client_metadata["x-codex-turn-metadata"]).toBe(upgradeMeta);
+  });
+
+  test("a frame's own turn-metadata wins over the upgrade copy", () => {
+    const own = JSON.stringify({ history_initialization: "ColdResume" });
+    const prepared = prepareCodexWsRequest(CODEX_RESPONSES_HTTP_URL, {
+      method: "POST",
+      headers: { "x-codex-turn-metadata": JSON.stringify({ history_initialization: "New" }), "content-type": "application/json" },
+      body: JSON.stringify({ model: "gpt-5", input: [], client_metadata: { "x-codex-turn-metadata": own } }),
+    } as RequestInit);
+    const frame = JSON.parse(prepared!.frameText);
+    expect(frame.client_metadata["x-codex-turn-metadata"]).toBe(own);
+  });
+
+  test("the real WS reader ignores the upgrade header: only the frame's client_metadata counts", () => {
+    const meta = JSON.stringify({ request_kind: "turn", thread_source: "user" });
+    expect(shadowCallPreservesSelectedModel({ client_metadata: {} }, new Headers({ "x-codex-turn-metadata": meta }), "websocket")).toBe(false);
+    expect(shadowCallPreservesSelectedModel({ client_metadata: { "x-codex-turn-metadata": meta } }, new Headers(), "websocket")).toBe(true);
+  });
+});
