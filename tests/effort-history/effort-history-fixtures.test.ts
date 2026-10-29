@@ -487,3 +487,28 @@ describe("change point position through the real serializer (round 13)", () => {
     expect(JSON.stringify(body2.messages[idx - 1])).toContain("env");
   });
 });
+
+// Round 13: projection covers items the serializer drops, and an orphan tool call is never a matched history.
+describe("projection: dropped and orphan items (round 13)", () => {
+  test("a configuration_update in the prefix: the serializer drops it, but the key still changes", async () => {
+    const cfg = { type: "configuration_update", reasoning: { effort: "high" } };
+    const withCfg = [userMsg("fix"), cfg, userMsg("next")];
+    const without = [userMsg("fix"), userMsg("next")];
+    const a = await serialize(withCfg, "low", { provider: pinnedProvider });
+    const b = await serialize(without, "low", { provider: pinnedProvider });
+    expect(contentOf(a.messages)).toEqual(contentOf(b.messages));
+    expect(hashItems([userMsg("fix"), cfg])).not.toBe(hashItems([userMsg("fix")]));
+  });
+
+  test("an orphan tool call (no output yet) in the new suffix is not a matched turn", async () => {
+    const store = createStore();
+    const input1 = [userMsg("fix the bug")];
+    const body1 = await serialize(input1, "high", { provider: pinnedProvider });
+    const d1 = decide(store, sliceRequest(input1, 0, body1, "high"), ON);
+    commit(store, d1.pendingToken, { messageStop: true, cacheRead: 0, P: 100, outputItems: [callItem], generation: "g1" });
+    const input2 = [...input1, callItem, userMsg("next")];
+    const body2 = await serialize(input2, "low", { provider: pinnedProvider });
+    const d2 = decide(store, sliceRequest(input2, 2, body2, "low"), ON);
+    expect(d2.action).toBe("off");
+  });
+});

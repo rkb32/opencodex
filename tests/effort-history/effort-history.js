@@ -23,6 +23,12 @@ const IN_SCOPE_MODEL = /^(claude-)?(mythos-5-1|opus-5-5|opus-5|sonnet-5-5|haiku-
 const ENDPOINT = "api.anthropic.com";
 // Effort names the serializer can emit (anthropic.ts adaptiveEffort / reasoningBudget).
 const EFFORTS = new Set(["minimal", "low", "medium", "high", "xhigh", "max"]);
+// A tool call with no output in the same request: the serializer would synthesize one the client never sent
+// (round 13, Ingwannu Oct 23: synthesized missing tool outputs must not match).
+function hasOrphanCall(items) {
+  const outputs = new Set(items.filter((i) => TOOL_OUTPUTS.has(i?.type)).map((i) => i.call_id));
+  return items.some((i) => (i?.type === "function_call" || i?.type === "custom_tool_call") && !outputs.has(i.call_id));
+}
 // Activation gates: no request reached the upstream path, so nothing is deleted.
 const GATE_REASONS = new Set(["switch-off", "not-activated", "websocket-before-activation"]);
 
@@ -171,6 +177,7 @@ function decideInner(store, req, opts = {}) {
 
   // Fable 5.1 is in scope only once its wire ID is checked against the Mythos rule; until then off.
   if (/fable/i.test(req.scope?.model ?? "")) return off("fable-wire-id-unchecked");
+  if (hasOrphanCall([...req.parent, ...req.suffix])) return off("orphan-tool-call");
   // No effort level ("none" or absent) cannot be a per-message effort value: off, as today.
   if (typeof req.effort !== "string" || !EFFORTS.has(req.effort)) return off("no-effort-level");
   // Rule 2: every scope part is required.
