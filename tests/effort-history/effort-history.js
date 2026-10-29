@@ -130,6 +130,8 @@ export function decide(store, req, opts = {}) {
 
   // Fable 5.1 is in scope only once its wire ID is checked against the Mythos rule; until then off.
   if (/fable/i.test(req.scope?.model ?? "")) return off("fable-wire-id-unchecked");
+  // No effort level ("none" or absent) cannot be a per-message effort value: off, as today.
+  if (typeof req.effort !== "string" || req.effort === "none") return off("no-effort-level");
   // Rule 2: every scope part is required.
   const s = req.scope;
   if (!s || SCOPE_PARTS.some((k) => !s[k])) return off("missing-scope");
@@ -219,8 +221,12 @@ export function decide(store, req, opts = {}) {
   if (parent.frame !== req.frame) return offSend(store, parentKey, "frame-mismatch");
   if (parent.generation !== req.generation) return offSend(store, parentKey, "generation-mismatch");
 
-  // Section 6: any output limit different from the anchor's is off.
-  if (effectiveLimit(req) !== parent.limit) return offSend(store, parentKey, "limit-differs");
+  // Section 6: any output limit different from the anchor's is off. Proposal (owner to decide,
+  // `limitRule: "caller-cap"`): compare only the caller's cap; the derived default is then sent per
+  // turn exactly as today, so no cap is raised or lowered. Default keeps the rule as stated.
+  if (opts.limitRule === "caller-cap") {
+    if ((req.callerCap ?? null) !== parent.callerCap) return offSend(store, parentKey, "limit-differs");
+  } else if (effectiveLimit(req) !== parent.limit) return offSend(store, parentKey, "limit-differs");
 
   if (userCount > 1) return offSend(store, parentKey, "more-than-one-user-message");
 
@@ -399,6 +405,7 @@ export function commit(store, token, result, now = Date.now()) {
     thinking: req.thinking,
     budget: BUDGET[mapEffort(req.effort)] ?? 8192,
     limit: effectiveLimit(req),
+    callerCap: req.callerCap ?? null,
     changePoints,
     P: result.P,
     version: store.nextVersion++,
@@ -447,7 +454,7 @@ export function abandon(store, token, { sent = true, restoreOnFailure = false } 
 // The input is carried as its chain digest (slot.inputHash), so no transcript text stays in memory.
 function pin(req) {
   return {
-    scope: req.scope, effort: req.effort, thinking: req.thinking, explicitCap: req.explicitCap,
+    scope: req.scope, effort: req.effort, thinking: req.thinking, explicitCap: req.explicitCap, callerCap: req.callerCap,
     omittedMaxTokens: req.omittedMaxTokens, frame: req.frame, generation: req.generation, changeAt: changePointAt(req),
   };
 }

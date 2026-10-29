@@ -366,3 +366,63 @@ describe("retained transcript bytes", () => {
     for (const secret of secrets) expect(text).not.toContain(secret);
   });
 });
+
+// Fixture-local transform for a matched turn (a proposal, not production code): keep the anchor's
+// top-level effort and add an effort-only system message before the new user message. max_tokens
+// stays exactly what today's serializer computes for this turn's effort.
+function applyEffortHistory(body: Record<string, any>, anchorEffort: string, effort: string) {
+  const messages = [...body.messages];
+  messages.splice(messages.length - 1, 0, { role: "system", content: [], output_config: { effort } });
+  return { ...body, output_config: { ...body.output_config, effort: anchorEffort }, messages };
+}
+
+describe("proposal: limit rule on the caller's cap only (owner decides)", () => {
+  const CALLER_CAP = { ...ON, limitRule: "caller-cap" };
+
+  test("omitted cap: matched, today's max_tokens is kept, and the prefix and top-level effort are unchanged", async () => {
+    const store = createStore();
+    const input = [userMsg("fix the bug")];
+    const body1 = await serialize(input, "high");
+    const d1 = decide(store, sliceRequest(input, 0, body1, "high"), CALLER_CAP);
+    const reply = await respond();
+    commit(store, d1.pendingToken, { messageStop: true, cacheRead: 0, P: 100, outputItems: reply.items, generation: "g1" });
+    const input2 = [...input, ...reply.items, userMsg("now the tests")];
+    const today = await serialize(input2, "low");
+    const d2 = decide(store, sliceRequest(input2, input.length + reply.items.length, today, "low"), CALLER_CAP);
+    expect(d2).toMatchObject({ kind: "matched", changePoint: true, insert: { effort: "low" } });
+
+    const sent = applyEffortHistory(today, "high", "low");
+    expect(sent.max_tokens).toBe(12288); // not raised to the anchor's 24576
+    expect(sent.output_config).toEqual(body1.output_config);
+    expect(sent.thinking).toEqual(body1.thinking);
+    expect(sent.system).toEqual(body1.system);
+    expect(sent.tools).toEqual(body1.tools);
+    expect(contentOf(sent.messages.slice(0, 1))).toEqual(contentOf(body1.messages));
+    expect(sent.messages.at(-2)).toEqual({ role: "system", content: [], output_config: { effort: "low" } });
+  });
+
+  test("a changed caller cap is still off", async () => {
+    const store = createStore();
+    const input = [userMsg("fix the bug")];
+    const body1 = await serialize(input, "high");
+    const d1 = decide(store, sliceRequest(input, 0, body1, "high"), CALLER_CAP);
+    const reply = await respond();
+    commit(store, d1.pendingToken, { messageStop: true, cacheRead: 0, P: 100, outputItems: reply.items, generation: "g1" });
+    const input2 = [...input, ...reply.items, userMsg("next")];
+    const body2 = await serialize(input2, "low", { maxOutput: 4096 });
+    expect(decide(store, sliceRequest(input2, input.length + reply.items.length, body2, "low", { callerCap: 4096 }), CALLER_CAP))
+      .toMatchObject({ action: "off", reason: "limit-differs" });
+  });
+});
+
+describe("effort none", () => {
+  test("Opus 5.5 none keeps the emitted thinking field, so the slice turns it off by effort, not by thinking", async () => {
+    const store = createStore();
+    const { body: body1, transcript } = await firstTurn(store);
+    const input2 = [...transcript, userMsg("next")];
+    const body2 = await serialize(input2, "none", { provider: pinnedProvider });
+    expect(body2.thinking).toEqual(body1.thinking);
+    expect(body2.output_config).toBeUndefined();
+    expect(decide(store, sliceRequest(input2, transcript.length, body2, "none"), ON)).toMatchObject({ action: "off", reason: "no-effort-level" });
+  });
+});
