@@ -57,11 +57,11 @@ function outputItemsOf(sse: string): Record<string, unknown>[] {
 let lastAdapter: ReturnType<typeof createAnthropicAdapter> | undefined;
 
 /** One Responses request through the real parser and Anthropic serializer. */
-async function serialize(input: unknown[], effort: string, opts: { model?: string; provider?: OcxProviderConfig; maxOutput?: number } = {}) {
+async function serialize(input: unknown[], effort: string, opts: { model?: string; provider?: OcxProviderConfig; maxOutput?: number; summary?: string } = {}) {
   const adapter = withTestTranslatorBudget(createAnthropicAdapter(opts.provider ?? keyProvider, "short"));
   const responses = {
     model: opts.model ?? MODEL, instructions: INSTRUCTIONS, tools: TOOLS, input, stream: true,
-    reasoning: { effort }, ...(opts.maxOutput !== undefined ? { max_output_tokens: opts.maxOutput } : {}),
+    reasoning: { effort, ...(opts.summary ? { summary: opts.summary } : {}) }, ...(opts.maxOutput !== undefined ? { max_output_tokens: opts.maxOutput } : {}),
   };
   const request = await adapter.buildRequest(parseRequest(responses), {} as never);
   lastAdapter = adapter;
@@ -424,5 +424,17 @@ describe("effort none", () => {
     expect(body2.thinking).toEqual(body1.thinking);
     expect(body2.output_config).toBeUndefined();
     expect(decide(store, sliceRequest(input2, transcript.length, body2, "none"), ON)).toMatchObject({ action: "off", reason: "no-effort-level" });
+  });
+});
+
+describe("thinking display (dev 9b78a16f4, #7728)", () => {
+  test("Opus 5.5: a reasoning.summary change mid-chat changes the emitted display, so it is a thinking change", async () => {
+    const store = createStore();
+    const { body: body1, transcript } = await firstTurn(store);
+    const input2 = [...transcript, userMsg("next")];
+    const body2 = await serialize(input2, "low", { provider: pinnedProvider, summary: "detailed" });
+    expect(body1.thinking).toEqual({ type: "adaptive", display: "updates" });
+    expect(body2.thinking).toEqual({ type: "adaptive", display: "summarized" });
+    expect(decide(store, sliceRequest(input2, transcript.length, body2, "low"), ON)).toMatchObject({ action: "off", reason: "thinking-change" });
   });
 });
