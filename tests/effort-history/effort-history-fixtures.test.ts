@@ -439,3 +439,51 @@ describe("thinking display (dev 9b78a16f4, #7728)", () => {
     expect(decide(store, sliceRequest(input2, transcript.length, body2, "low"), ON)).toMatchObject({ action: "off", reason: "thinking-change" });
   });
 });
+
+// Round 13: the slice's change point is a Responses input index. The adapter maps it to an Anthropic
+// message index by serializing the prefix, and the fixtures check that mapping against the real serializer.
+async function messageIndexOf(input: unknown[], at: number, effort = "low") {
+  const prefix = await serialize(input.slice(0, at), effort, { provider: pinnedProvider });
+  return prefix.messages.length;
+}
+function insertEffortAt(messages: Array<Record<string, unknown>>, index: number, effort: string) {
+  return [...messages.slice(0, index), { role: "system", content: [], output_config: { effort } }, ...messages.slice(index)];
+}
+const callItem = { type: "function_call", call_id: "call_1", name: "shell", arguments: "{\"cmd\":\"ls\"}" };
+const outItem = { type: "function_call_output", call_id: "call_1", output: "a.txt" };
+const devItem = { type: "message", role: "developer", content: [{ type: "input_text", text: "env" }] };
+
+describe("change point position through the real serializer (round 13)", () => {
+  test("tool loop: the change point lands after the tool result and before the new user message", async () => {
+    const store = createStore();
+    const input1 = [userMsg("fix the bug")];
+    const body1 = await serialize(input1, "high", { provider: pinnedProvider });
+    const d1 = decide(store, sliceRequest(input1, 0, body1, "high"), ON);
+    commit(store, d1.pendingToken, { messageStop: true, cacheRead: 0, P: 100, outputItems: [callItem], generation: "g1" });
+    const input2 = [...input1, callItem, outItem, userMsg("now the tests")];
+    const body2 = await serialize(input2, "low", { provider: pinnedProvider });
+    const d2 = decide(store, sliceRequest(input2, 2, body2, "low"), ON);
+    expect(d2).toMatchObject({ kind: "matched", changePoint: true });
+    const idx = await messageIndexOf(input2, d2.insert.at);
+    expect(body2.messages[idx]).toMatchObject({ role: "user" });
+    expect(JSON.stringify(body2.messages[idx])).toContain("now the tests");
+    expect(JSON.stringify(body2.messages[idx - 1])).toContain("tool_result");
+    expect(insertEffortAt(body2.messages, idx, "low")[idx]).toEqual({ role: "system", content: [], output_config: { effort: "low" } });
+  });
+
+  test("developer item in the new suffix: the index still lands before the user message", async () => {
+    const store = createStore();
+    const input1 = [userMsg("fix the bug")];
+    const body1 = await serialize(input1, "high", { provider: pinnedProvider });
+    const d1 = decide(store, sliceRequest(input1, 0, body1, "high"), ON);
+    const reply = (await respond()).items;
+    commit(store, d1.pendingToken, { messageStop: true, cacheRead: 0, P: 100, outputItems: reply, generation: "g1" });
+    const input2 = [...input1, ...reply, devItem, userMsg("next")];
+    const body2 = await serialize(input2, "low", { provider: pinnedProvider });
+    const d2 = decide(store, sliceRequest(input2, input1.length + reply.length, body2, "low"), ON);
+    expect(d2.kind).toBe("matched");
+    const idx = await messageIndexOf(input2, d2.insert.at);
+    expect(JSON.stringify(body2.messages[idx])).toContain("next");
+    expect(JSON.stringify(body2.messages[idx - 1])).toContain("env");
+  });
+});

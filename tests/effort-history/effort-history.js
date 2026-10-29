@@ -286,7 +286,9 @@ function admitMatched(store, plan) {
     anchorEffort: plan.parent.anchorEffort,
     changePoint: plan.changePoint,
     shape: plan.shape,
-    // What the adapter inserts for the change point: an effort-only system message at this position.
+    // What the adapter inserts for the change point: an effort-only system message before the new user
+    // message. `at` is a Responses input index; the adapter maps it to an Anthropic message index by
+    // serializing the prefix (fixtures: messageIndexOf). Tool results and developer items are checked there.
     // The wire form (role, JSON shape) is not yet verified (contract section 13, open item).
     insert: plan.changePoint ? { at: changePointAt(plan.req), effort: mapEffort(plan.req.effort) } : null,
     // Every change point on this chat, in prefix order, so the adapter re-sends all of them each turn.
