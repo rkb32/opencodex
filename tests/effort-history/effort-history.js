@@ -1,6 +1,9 @@
 // Offline slice of the effort-history contract (revision 9). Pure logic, no network,
 // no imports from opencodex. Nothing here is wired into production requests.
-import { createHash } from "node:crypto";
+import { createHmac, randomBytes } from "node:crypto";
+
+// Per-process key: fingerprints are not reproducible outside this process (repo pattern: reasoning-replay-cache.ts).
+const hashKey = randomBytes(32);
 
 export const MAX_ENTRIES = 64;
 export const MAX_TOTAL_BYTES = 512 * 1024; // section 12, hard bound
@@ -10,6 +13,9 @@ export const MAX_BUFFER_BYTES = 128 * 1024;
 // Change points are re-sent on every later turn, so their count is capped (owner to confirm).
 export const MAX_CHANGE_POINTS = 64;
 export const ENTRY_TTL_MS = 60 * 60 * 1000; // 1 hour from last use (section 12)
+// Proposed fixture policy, not accepted by the owner: a model/destination refusal is remembered this long.
+export const CAPABILITY_TTL_MS = 60 * 60 * 1000;
+const MAX_CAPABILITY = 256; // proposed fixture policy
 export const PENDING_TTL_MS = 10 * 60 * 1000; // proposed fixture policy, not accepted by the owner
 export const SCOPE_PARTS = ["cohort", "provider", "destination", "adapter", "model", "credential", "authMode"];
 // Section 2: api.anthropic.com only, six models. Fable 5.1 stays off until its wire ID is checked.
@@ -31,7 +37,7 @@ function canonical(value) {
 const stableJson = (value) => JSON.stringify(canonical(value));
 // The one projection used for commit and lookup (section 6). Key order is canonical; nothing else is dropped.
 export const project = (items) => canonical(items);
-export const hash = (value) => createHash("sha256").update(stableJson(value)).digest("hex");
+export const hash = (value) => createHmac("sha256", hashKey).update(stableJson(value)).digest("hex");
 // Every item hash (lookup and commit) goes through project(). A prefix digest is a chain over
 // per-item digests, so a pending slot can extend it at commit without keeping any item text.
 const extendChain = (digest, items) => items.reduce((d, item) => hash([d, hash(project(item))]), digest);
@@ -115,11 +121,24 @@ function offSend(store, parentKey, reason) {
 
 // Drop entries past their TTL and pending slots past theirs.
 function sweep(store, now) {
+  for (const [key, cap] of store.capability) {
+    if (now - cap.at > CAPABILITY_TTL_MS) store.capability.delete(key);
+  }
   for (const [key, entry] of store.entries) {
     if (now - entry.lastUsed > ENTRY_TTL_MS) store.entries.delete(key);
   }
   for (const [key, slot] of store.pending) {
     if (now - slot.createdAt > PENDING_TTL_MS) store.pending.delete(key);
+  }
+}
+
+// Section 2 (owner note, 2026-10-19): an account, provider, or model change ends the old scope of this chat.
+function endOtherScopes(store, lineage, scopeKey) {
+  for (const [key, entry] of store.entries) {
+    if (entry.lineageKey === lineage && entry.scopeKey !== scopeKey) store.entries.delete(key);
+  }
+  for (const [key, slot] of store.pending) {
+    if (slot.req?.chatLineage !== undefined && hash(slot.req.chatLineage) === lineage && slot.scopeKey !== scopeKey) store.pending.delete(key);
   }
 }
 
@@ -164,6 +183,7 @@ function decideInner(store, req, opts = {}) {
   // Without one, nothing is optimized (off), and entries and replay records are per chat.
   if (!req.chatLineage) return off("no-chat-lineage");
   const scopeKey = hash([s, req.chatLineage]);
+  endOtherScopes(store, hash(req.chatLineage), scopeKey);
   const parentHash = hashItems(req.parent);
   const parentKey = entryKey(scopeKey, parentHash);
   const inputHash = hashItems([...req.parent, ...req.suffix]);
@@ -173,7 +193,8 @@ function decideInner(store, req, opts = {}) {
   if (req.stripped) return offSend(store, parentKey, "proxy-stripped");
 
   // Rule 3a: an unsupported capability record.
-  if (store.capability.get(capabilityKey(s)) === "unsupported") return offSend(store, parentKey, "capability-unsupported");
+  const cap = store.capability.get(capabilityKey(s));
+  if (cap && cap.state === "unsupported" && now - cap.at <= CAPABILITY_TTL_MS) return offSend(store, parentKey, "capability-unsupported");
 
   // Rule 3b runs before rule 4: a thinking change on a matching parent. `thinking` is the emitted
   // `thinking` field as serialized. Only emitted fields count: an emitted `budget_tokens` change is a
@@ -237,7 +258,7 @@ function decideInner(store, req, opts = {}) {
     const version = store.nextVersion++;
     const token = `${placeholder}:${version}`;
     store.pending.set(placeholder, {
-      kind: "new", key: placeholder, token, version, createdAt: now, inputHash, scopeKey, req: pin(req), attemptGeneration: req.generation,
+      kind: "new", key: placeholder, token, version, createdAt: now, inputHash, scopeKey, req: pin(req), pinnedBytes: bytesOf(pin(req)), attemptGeneration: req.generation,
     });
     return { action: "send", kind: "new", pendingToken: token, anchorEffort: mapEffort(req.effort) };
   }
@@ -277,7 +298,7 @@ function admitMatched(store, plan) {
   store.pending.set(plan.parentKey, {
     kind: "matched", key: plan.parentKey, token, version, createdAt: plan.now, inputHash: plan.inputHash,
     attemptGeneration: plan.req.generation,
-    scopeKey: plan.scopeKey, entry: plan.parent, req: pin(plan.req), changePoint: plan.changePoint,
+    scopeKey: plan.scopeKey, entry: plan.parent, req: pin(plan.req), pinnedBytes: bytesOf(pin(plan.req)), changePoint: plan.changePoint,
   });
   return {
     action: "send",
@@ -308,7 +329,7 @@ function totalBytes(store) {
   // Streaming output buffered for a pending slot counts too (section 12).
   for (const slot of store.pending.values()) {
     if (slot.entry) total += slot.entry.bytes;
-    total += slot.buffered ?? 0;
+    total += (slot.pinnedBytes ?? 0) + (slot.buffered ?? 0);
   }
   return total;
 }
@@ -438,6 +459,7 @@ function commitInner(store, token, result, now = Date.now()) {
     prefixHash,
     inputHash: slot.inputHash,
     effortInEffect,
+    lineageKey: hash(req.chatLineage),
     anchorEffort: prior ? prior.anchorEffort : effort,
     thinking: req.thinking,
     budget: BUDGET[mapEffort(req.effort)] ?? 8192,
@@ -466,7 +488,8 @@ function rejectInner(store, token, { status, errorText = "" } = {}) {
   const slot = takeSlot(store, token);
   if (!slot) return { action: "dropped", reason: "pending-missing" };
   if (status === 400 && typeof errorText === "string" && errorText.includes(BETA_FRAGMENT)) {
-    store.capability.set(capabilityKey(slot.req.scope), "unsupported");
+    store.capability.set(capabilityKey(slot.req.scope), { state: "unsupported", at: Date.now() });
+    while (store.capability.size > MAX_CAPABILITY) store.capability.delete(store.capability.keys().next().value);
     return { action: "off", reason: "capability-unsupported", deleted: true };
   }
   // Any other error (other 400, 5xx, transport failure): error to the caller, no resend, no capability record.
@@ -491,7 +514,7 @@ function abandonInner(store, token, { sent = true, restoreOnFailure = false } = 
 // The input is carried as its chain digest (slot.inputHash), so no transcript text stays in memory.
 function pin(req) {
   return {
-    scope: req.scope, effort: req.effort, thinking: req.thinking, explicitCap: req.explicitCap, callerCap: req.callerCap,
+    chatLineage: req.chatLineage, scope: req.scope, effort: req.effort, thinking: req.thinking, explicitCap: req.explicitCap, callerCap: req.callerCap,
     emittedMaxTokens: req.emittedMaxTokens, omittedMaxTokens: req.omittedMaxTokens,
     frame: req.frame, generation: req.generation, changeAt: changePointAt(req),
   };
