@@ -547,3 +547,59 @@ describe("real WebSocket metadata functions (round 13)", () => {
     expect(shadowCallPreservesSelectedModel({ client_metadata: { "x-codex-turn-metadata": meta } }, new Headers(), "websocket")).toBe(true);
   });
 });
+
+const COLD_RESUME_META = JSON.stringify({ history_initialization: "ColdResume" });
+
+describe("resume, restart, and scope change through the real serializer", () => {
+  test("HTTP resume: a ColdResume request over a transcript with no stored entry is off", async () => {
+    const { transcript } = await firstTurn(createStore());
+    const input2 = [...transcript, userMsg("next")];
+    const body2 = await serialize(input2, "low", { provider: pinnedProvider });
+    expect(decide(createStore(), sliceRequest(input2, transcript.length, body2, "low", { turnMetadata: COLD_RESUME_META }), ON))
+      .toMatchObject({ action: "off", reason: "no-history" });
+  });
+
+  test("HTTP restart: a New request over a transcript with no stored entry is off", async () => {
+    const { transcript } = await firstTurn(createStore());
+    const input2 = [...transcript, userMsg("next")];
+    const body2 = await serialize(input2, "low", { provider: pinnedProvider });
+    expect(decide(createStore(), sliceRequest(input2, transcript.length, body2, "low", { turnMetadata: NEW_META }), ON))
+      .toMatchObject({ action: "off", reason: "no-history" });
+  });
+
+  test("WebSocket resume and restart: the frame's own metadata, read through the real WS path, is off with no stored entry", async () => {
+    const { transcript } = await firstTurn(createStore());
+    const input2 = [...transcript, userMsg("next")];
+    const body2 = await serialize(input2, "low", { provider: pinnedProvider });
+    for (const meta of [COLD_RESUME_META, NEW_META]) {
+      const prepared = prepareCodexWsRequest(CODEX_RESPONSES_HTTP_URL, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model: "gpt-5", input: [], client_metadata: { "x-codex-turn-metadata": meta } }),
+      } as RequestInit);
+      const turnMetadata = JSON.parse(prepared!.frameText).client_metadata["x-codex-turn-metadata"];
+      const req = sliceRequest(input2, transcript.length, body2, "low", { transport: "websocket", turnMetadata });
+      expect(decide(createStore(), req, { ...ON, websocketHeaderRead: true })).toMatchObject({ action: "off", reason: "no-history" });
+    }
+  });
+
+  test("account change mid-chat: the new credential has no entry, so the request is off, and the old chat's entry is deleted", async () => {
+    const store = createStore();
+    const { transcript } = await firstTurn(store);
+    const input2 = [...transcript, userMsg("next")];
+    const body2 = await serialize(input2, "low", { provider: pinnedProvider });
+    expect(decide(store, sliceRequest(input2, transcript.length, body2, "low", { scope: { ...scope, credential: "acct-2" } }), ON))
+      .toMatchObject({ action: "off", reason: "no-history" });
+    expect(store.entries.size).toBe(0);
+  });
+
+  test("model change mid-chat: a different in-scope model has no entry, so the request is off, and the old chat's entry is deleted", async () => {
+    const store = createStore();
+    const { transcript } = await firstTurn(store);
+    const input2 = [...transcript, userMsg("next")];
+    const body2 = await serialize(input2, "low", { provider: pinnedProvider, model: FIXED_MODEL });
+    expect(decide(store, sliceRequest(input2, transcript.length, body2, "low", { scope: { ...scope, model: FIXED_MODEL } }), ON))
+      .toMatchObject({ action: "off", reason: "no-history" });
+    expect(store.entries.size).toBe(0);
+  });
+});
